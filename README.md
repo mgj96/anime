@@ -97,6 +97,8 @@ Next.js 15 App Router와 Vercel Serverless, Neon Postgres를 기반으로 구축
 | `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/apikey)에 로그인 → **Get API key** → **Create API key** |
 | `JIMAKU_API_KEY` | [jimaku.cc](https://jimaku.cc) 가입 → [계정 페이지](https://jimaku.cc/account)에서 API 키 생성 |
 | `GEMINI_MODEL` (선택) | 기본값 `gemini-3.5-flash-lite`. 다른 모델을 쓰려면 모델 ID 입력 |
+| `AI_SUBTITLE_RPM` (선택) | 분당 Gemini 호출 상한. 기본값 `5` |
+| `AI_SUBTITLE_RPD` (선택) | 일일 Gemini 호출 상한. 기본값 `100` |
 
 > ⚠️ **Gemini 앱 구독(Google AI Plus/Pro 등)과 Gemini API는 별개입니다.** 구독 중이어도 API 키는 AI Studio에서 따로 발급해야 하며, 구독 혜택이 API 한도에 적용되지 않습니다.
 
@@ -115,3 +117,12 @@ JIMAKU_API_KEY=...
 ### 3. 무료 티어 주의 사항
 - 무료 티어는 분당/일일 **요청 한도**가 있습니다. 한도에 도달하면 "무료 사용량 한도에 도달했습니다" 안내가 표시되며, 잠시 후 다시 시도하면 됩니다.
 - 무료 티어에서는 **입력한 내용(자막 원문)이 Google 제품 개선에 사용될 수 있습니다.** ([Gemini API 가격 정책](https://ai.google.dev/gemini-api/docs/pricing) 참고)
+
+### 4. 호출 한도 관리
+무료 티어 한도(분당/일일 요청 수, 분당 토큰 수)는 **프로젝트 단위**로 적용되며, 정확한 값은 공개 표가 없어 [AI Studio 한도 페이지](https://aistudio.google.com/rate-limit)에서 확인해야 합니다. 서버는 Gemini를 부르기 전에 DB로 한도를 먼저 확인합니다.
+
+- 번역된 회차는 DB에 캐시되어, 같은 회차를 다른 사용자가 눌러도 Gemini를 다시 호출하지 않습니다.
+- 같은 회차를 여러 명이 동시에 누르면 한 요청만 번역하고 나머지는 잠시 후 다시 시도하도록 안내합니다.
+- 호출 수는 서버리스 인스턴스끼리 공유되도록 DB(`ai_usage_log`)에 기록합니다. `AI_SUBTITLE_RPM` / `AI_SUBTITLE_RPD`를 AI Studio에서 확인한 값보다 조금 낮게 설정하세요.
+- 일일 카운터는 Google과 같이 **태평양 시간 자정**(한국 시간 16:00, 겨울철 17:00)에 초기화됩니다.
+- 그래도 Gemini가 429를 반환하면 응답에 담긴 대기 시간(없으면 60초) 동안 호출을 멈춥니다.

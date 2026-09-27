@@ -266,6 +266,37 @@ export async function initDb() {
     }
   }
 
+  // 13. AI 번역 호출 기록 Table (서버리스 인스턴스 간 공유되는 무료 티어 호출 카운터)
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS ai_usage_log (
+        id SERIAL PRIMARY KEY,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_ai_usage_log_created ON ai_usage_log(created_at);
+    `;
+  } catch (e: any) {
+    if (e?.code !== "23505" && !e?.message?.includes("already exists")) {
+      console.warn("[initDb ai_usage_log warning]:", e?.message);
+    }
+  }
+
+  // 14. AI 번역 회차 잠금 Table (같은 회차 동시 번역으로 호출이 중복 소모되는 것 방지)
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS ai_subtitle_lock (
+        cache_key VARCHAR(200) PRIMARY KEY,
+        locked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+  } catch (e: any) {
+    if (e?.code !== "23505" && !e?.message?.includes("already exists")) {
+      console.warn("[initDb ai_subtitle_lock warning]:", e?.message);
+    }
+  }
+
   isInitialized = true;
 }
 
@@ -1239,5 +1270,124 @@ export async function setAiSubtitleCache(data: AiSubtitleCache): Promise<boolean
   } catch (e) {
     console.error("[db.setAiSubtitleCache error]:", e);
     return false;
+  }
+}
+
+// ----------------------------------------------------
+// 13. AI 번역 무료 티어 호출 한도 Helpers
+// ----------------------------------------------------
+// Gemini 한도는 프로젝트 단위, 일일 한도(RPD)는 태평양 시간 자정에 초기화됨.
+// 서버리스 인스턴스끼리 메모리를 공유하지 않으므로 카운터는 DB에 둠.
+// DB가 없거나 오류가 나면 허용(fail-open)하고, 최종 판정은 Gemini의 429에 맡김.
+
+const AI_QUOTA_COOLDOWN_KEY = "ai_quota_cooldown_until";
+
+export type AiQuotaResult =
+  | { ok: true }
+  | { ok: false; reason: "cooldown" | "minute" | "day"; retryAt: Date | null };
+
+export async function reserveAiQuota(rpm: number, rpd: number): Promise<AiQuotaResult> {
+  const sql = getDb();
+  if (!sql) return { ok: true };
+  await initDb();
+  try {
+    // 조건 확인과 기록을 한 문장으로 처리 (동시 요청 시 약간의 초과는 Gemini 429가 최종 방어)
+    const inserted = await sql`
+      INSERT INTO ai_usage_log (created_at)
+      SELECT CURRENT_TIMESTAMP
+      WHERE NOT EXISTS (
+          SELECT 1 FROM system_settings
+          WHERE key = ${AI_QUOTA_COOLDOWN_KEY}
+            -- 다른 설정 값에 timestamptz 캐스트가 먼저 평가되지 않도록 CASE로 감쌈
+            AND (CASE WHEN key = ${AI_QUOTA_COOLDOWN_KEY} THEN value::timestamptz END) > CURRENT_TIMESTAMP
+        )
+        AND (SELECT COUNT(*) FROM ai_usage_log WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 minute') < ${rpm}
+        AND (
+          SELECT COUNT(*) FROM ai_usage_log
+          WHERE created_at >= (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'America/Los_Angeles') AT TIME ZONE 'America/Los_Angeles')
+        ) < ${rpd}
+      RETURNING id;
+    `;
+    if (inserted.length > 0) {
+      // 오래된 기록 정리 (일일 한도 계산에 필요한 범위만 유지)
+      await sql`DELETE FROM ai_usage_log WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '2 days';`;
+      return { ok: true };
+    }
+
+    const rows = await sql`
+      SELECT
+        (SELECT value::timestamptz FROM system_settings WHERE key = ${AI_QUOTA_COOLDOWN_KEY}) AS cooldown_until,
+        (SELECT COUNT(*) FROM ai_usage_log
+          WHERE created_at >= (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'America/Los_Angeles') AT TIME ZONE 'America/Los_Angeles')) AS day_count,
+        ((date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'America/Los_Angeles') + INTERVAL '1 day') AT TIME ZONE 'America/Los_Angeles') AS day_reset_at,
+        (SELECT MIN(created_at) + INTERVAL '1 minute' FROM ai_usage_log
+          WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 minute') AS minute_reset_at,
+        CURRENT_TIMESTAMP AS now;
+    `;
+    const r = rows[0] || {};
+    const now = new Date(r.now || Date.now());
+    if (r.cooldown_until && new Date(r.cooldown_until) > now) {
+      return { ok: false, reason: "cooldown", retryAt: new Date(r.cooldown_until) };
+    }
+    if (Number(r.day_count) >= rpd) {
+      return { ok: false, reason: "day", retryAt: r.day_reset_at ? new Date(r.day_reset_at) : null };
+    }
+    return { ok: false, reason: "minute", retryAt: r.minute_reset_at ? new Date(r.minute_reset_at) : null };
+  } catch (e) {
+    console.error("[db.reserveAiQuota error]:", e);
+    return { ok: true };
+  }
+}
+
+// Gemini가 429를 반환하면 그 시각까지 호출을 멈춤 (기존 쿨다운보다 짧게 덮어쓰지 않음)
+export async function setAiQuotaCooldown(seconds: number): Promise<boolean> {
+  const sql = getDb();
+  if (!sql) return false;
+  await initDb();
+  try {
+    const until = new Date(Date.now() + Math.max(1, seconds) * 1000).toISOString();
+    await sql`
+      INSERT INTO system_settings (key, value, updated_at)
+      VALUES (${AI_QUOTA_COOLDOWN_KEY}, ${until}, CURRENT_TIMESTAMP)
+      ON CONFLICT (key)
+      DO UPDATE SET
+        value = GREATEST(system_settings.value::timestamptz, EXCLUDED.value::timestamptz)::text,
+        updated_at = CURRENT_TIMESTAMP;
+    `;
+    return true;
+  } catch (e) {
+    console.error("[db.setAiQuotaCooldown error]:", e);
+    return false;
+  }
+}
+
+// 같은 회차 동시 번역 잠금. 90초가 지난 잠금은 비정상 종료로 보고 인수 (maxDuration 60초)
+export async function acquireAiSubtitleLock(cacheKey: string): Promise<boolean> {
+  const sql = getDb();
+  if (!sql) return true;
+  await initDb();
+  try {
+    const rows = await sql`
+      INSERT INTO ai_subtitle_lock (cache_key, locked_at)
+      VALUES (${cacheKey}, CURRENT_TIMESTAMP)
+      ON CONFLICT (cache_key)
+      DO UPDATE SET locked_at = CURRENT_TIMESTAMP
+      WHERE ai_subtitle_lock.locked_at < CURRENT_TIMESTAMP - INTERVAL '90 seconds'
+      RETURNING cache_key;
+    `;
+    return rows.length > 0;
+  } catch (e) {
+    console.error("[db.acquireAiSubtitleLock error]:", e);
+    return true;
+  }
+}
+
+export async function releaseAiSubtitleLock(cacheKey: string): Promise<void> {
+  const sql = getDb();
+  if (!sql) return;
+  try {
+    await sql`DELETE FROM ai_subtitle_lock WHERE cache_key = ${cacheKey};`;
+  } catch (e) {
+    console.error("[db.releaseAiSubtitleLock error]:", e);
   }
 }

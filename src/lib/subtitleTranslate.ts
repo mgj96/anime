@@ -9,9 +9,12 @@ export function getGeminiModel(): string {
 }
 
 export class RateLimitError extends Error {
-  constructor(message = "Gemini rate limit exceeded") {
+  // Gemini 429 응답의 RetryInfo.retryDelay (초). 없으면 null
+  retryAfterSec: number | null;
+  constructor(message = "Gemini rate limit exceeded", retryAfterSec: number | null = null) {
     super(message);
     this.name = "RateLimitError";
+    this.retryAfterSec = retryAfterSec;
   }
 }
 
@@ -193,15 +196,22 @@ export async function translateLinesWithFallback(
     }
   };
 
+  // 첫 요청의 한도 초과는 그대로 전달 (번역된 줄이 없으므로)
   await runBatch(lines);
 
-  for (let round = 0; round < MAX_RETRY_ROUNDS; round++) {
-    const missing = lines.filter((l) => !result.has(l.id));
-    if (missing.length === 0 || !shouldRetry()) break;
-    console.warn(`[AI subtitle] retry round ${round + 1}: ${missing.length} missing lines`);
-    for (let s = 0; s < missing.length; s += RETRY_CHUNK_SIZE) {
-      await runBatch(missing.slice(s, s + RETRY_CHUNK_SIZE));
+  // 재요청 중 한도에 걸리면 재요청만 멈추고, 이미 번역된 줄은 살림
+  try {
+    for (let round = 0; round < MAX_RETRY_ROUNDS; round++) {
+      const missing = lines.filter((l) => !result.has(l.id));
+      if (missing.length === 0 || !shouldRetry()) break;
+      console.warn(`[AI subtitle] retry round ${round + 1}: ${missing.length} missing lines`);
+      for (let s = 0; s < missing.length; s += RETRY_CHUNK_SIZE) {
+        await runBatch(missing.slice(s, s + RETRY_CHUNK_SIZE));
+      }
     }
+  } catch (e) {
+    if (!(e instanceof RateLimitError)) throw e;
+    console.warn("[AI subtitle] rate limited during retry, keeping partial result");
   }
 
   return result;
@@ -273,7 +283,17 @@ export const callGeminiTranslate: TranslateBatchFn = async (lines) => {
   );
 
   if (res.status === 429) {
-    throw new RateLimitError();
+    // error.details[]의 google.rpc.RetryInfo.retryDelay (예: "34s")가 있으면 사용
+    let retryAfterSec: number | null = null;
+    try {
+      const errBody = await res.json();
+      const retryInfo = (errBody?.error?.details || []).find(
+        (d: { "@type"?: string }) => typeof d?.["@type"] === "string" && d["@type"].endsWith("RetryInfo")
+      );
+      const parsed = parseFloat(String(retryInfo?.retryDelay || ""));
+      if (!isNaN(parsed) && parsed > 0) retryAfterSec = Math.ceil(parsed);
+    } catch {}
+    throw new RateLimitError("Gemini rate limit exceeded", retryAfterSec);
   }
   if (!res.ok) {
     // 보안: 응답 본문에 키가 포함되지 않지만, 로그에는 상태 코드와 앞부분만 남김

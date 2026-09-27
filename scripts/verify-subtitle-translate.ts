@@ -8,6 +8,7 @@ import {
   parseVttForTranslation,
   translateLinesWithFallback,
   translateSubtitleToKorean,
+  RateLimitError,
   SubtitleLine,
   TranslatedLine,
 } from "../src/lib/subtitleTranslate";
@@ -190,6 +191,29 @@ async function main() {
   await check("재요청은 최대 2회, 남은 줄은 결과에서 빠짐(=원문 유지)", () => {
     assert.equal(failCalls, 3);
     assert.deepEqual([...partial.keys()], [0]);
+  });
+
+  console.log("4. 한도 초과(429) 처리");
+  const firstLimited = async (): Promise<TranslatedLine[] | null> => {
+    throw new RateLimitError("limit", 30);
+  };
+  await check("첫 요청이 한도에 걸리면 RateLimitError를 그대로 전달 (retryAfterSec 유지)", async () => {
+    await assert.rejects(
+      translateLinesWithFallback(lines.slice(0, 5), firstLimited),
+      (e: unknown) => e instanceof RateLimitError && e.retryAfterSec === 30
+    );
+  });
+
+  let limitedCalls = 0;
+  const retryLimited = async (batch: SubtitleLine[]): Promise<TranslatedLine[] | null> => {
+    limitedCalls++;
+    if (limitedCalls === 1) return batch.slice(0, 3).map((l) => ({ id: l.id, ko: `KO:${l.text}` }));
+    throw new RateLimitError("limit");
+  };
+  const kept = await translateLinesWithFallback(lines.slice(0, 5), retryLimited);
+  await check("재요청 중 한도에 걸리면 재요청만 멈추고 번역된 줄은 유지", () => {
+    assert.equal(limitedCalls, 2);
+    assert.deepEqual([...kept.keys()], [0, 1, 2]);
   });
 
   console.log(`\n모든 검증 통과 (${passed}개)`);
