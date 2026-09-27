@@ -248,6 +248,24 @@ export async function initDb() {
     }
   }
 
+  // 12. AI 번역 자막 캐시 Table (회차당 1회만 번역하기 위한 독립 신설 테이블)
+  try {
+    await sql`
+      CREATE TABLE IF NOT EXISTS ai_subtitle_cache (
+        cache_key VARCHAR(200) PRIMARY KEY,
+        content TEXT NOT NULL,
+        format VARCHAR(10) NOT NULL,
+        is_ass BOOLEAN NOT NULL,
+        orig_filename TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+  } catch (e: any) {
+    if (e?.code !== "23505" && !e?.message?.includes("already exists")) {
+      console.warn("[initDb ai_subtitle_cache warning]:", e?.message);
+    }
+  }
+
   isInitialized = true;
 }
 
@@ -1163,3 +1181,63 @@ export async function getBatchOnnadaCardCache(searchKeys: string[]): Promise<Map
   return result;
 }
 
+
+// ----------------------------------------------------
+// 12. AI 번역 자막 캐시 Helpers
+// ----------------------------------------------------
+
+export interface AiSubtitleCache {
+  cache_key: string; // `${anilistId}:${ep}:${model}`
+  content: string;
+  format: "ASS" | "VTT";
+  is_ass: boolean;
+  orig_filename?: string | null;
+}
+
+export async function getAiSubtitleCache(cacheKey: string): Promise<AiSubtitleCache | null> {
+  const sql = getDb();
+  if (!sql) return null;
+  await initDb();
+  try {
+    const rows = await sql`
+      SELECT cache_key, content, format, is_ass, orig_filename
+      FROM ai_subtitle_cache
+      WHERE cache_key = ${cacheKey}
+      LIMIT 1;
+    `;
+    if (rows.length === 0) return null;
+    return {
+      cache_key: rows[0].cache_key,
+      content: rows[0].content,
+      format: rows[0].format === "ASS" ? "ASS" : "VTT",
+      is_ass: Boolean(rows[0].is_ass),
+      orig_filename: rows[0].orig_filename || null,
+    };
+  } catch (e) {
+    console.error("[db.getAiSubtitleCache error]:", e);
+    return null;
+  }
+}
+
+export async function setAiSubtitleCache(data: AiSubtitleCache): Promise<boolean> {
+  const sql = getDb();
+  if (!sql) return false;
+  await initDb();
+  try {
+    await sql`
+      INSERT INTO ai_subtitle_cache (cache_key, content, format, is_ass, orig_filename, created_at)
+      VALUES (${data.cache_key}, ${data.content}, ${data.format}, ${data.is_ass}, ${data.orig_filename || null}, NOW())
+      ON CONFLICT (cache_key)
+      DO UPDATE SET
+        content = EXCLUDED.content,
+        format = EXCLUDED.format,
+        is_ass = EXCLUDED.is_ass,
+        orig_filename = EXCLUDED.orig_filename,
+        created_at = NOW();
+    `;
+    return true;
+  } catch (e) {
+    console.error("[db.setAiSubtitleCache error]:", e);
+    return false;
+  }
+}

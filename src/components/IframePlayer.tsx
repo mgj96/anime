@@ -464,6 +464,7 @@ export default function IframePlayer({
 
   // 5. Fetch Korean subtitles for this anime
   const [resolvedTitle, setResolvedTitle] = useState<string>("");
+  const [aiAvailable, setAiAvailable] = useState(false);
 
   useEffect(() => {
     let isCancelled = false;
@@ -483,6 +484,7 @@ export default function IframePlayer({
         if (isCancelled) return;
 
         if (data.success) {
+          setAiAvailable(data.ai_available === true);
           if (data.resolved_title) {
             setResolvedTitle(data.resolved_title);
           }
@@ -1317,6 +1319,7 @@ export default function IframePlayer({
         creators={creators}
         currentSubName={subtitles[currentSubIndex]?.name}
         onSelectSubtitle={handleSelectSubtitle}
+        showAiGenerate={aiAvailable && subtitles.length === 0}
       />
     </div>
   );

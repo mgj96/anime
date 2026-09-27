@@ -165,6 +165,10 @@ export default function Player(props: PlayerProps) {
   const pendingSubtitleRef = useRef<SubtitleItem | null>(null);
   const applySubtitleRef = useRef<((sub: SubtitleItem, offset?: number) => void) | null>(null);
   const refreshSubtitleSettingsRef = useRef<((currentSubs: SubtitleItem[], activeIdx: number) => void) | null>(null);
+  // AI 한글자막: 서버에서 기능이 켜져 있고 받아온 자막이 0개일 때만 selector에 생성 항목 노출
+  const aiSubOfferRef = useRef<boolean>(false);
+  const aiSubLoadingRef = useRef<boolean>(false);
+  const generateAiSubRef = useRef<(() => void) | null>(null);
   const currentSyncOffsetRef = useRef<number>(0.0);
   const docPipWindowRef = useRef<Window | null>(null);
   const docPipPlaceholderRef = useRef<HTMLDivElement | null>(null);
@@ -1717,6 +1721,15 @@ export default function Player(props: PlayerProps) {
         });
       }
 
+      if (aiSubOfferRef.current) {
+        subSelectorOptions.push({
+          html: "✨ AI 한글자막 생성",
+          subData: { name: "AI 한글자막 생성", format: "VTT", is_ass: false, url: "" },
+          aiGenerate: true,
+          default: false,
+        });
+      }
+
       subSelectorOptions.push({
         html: "🚫 자막 끄기",
         subData: { name: "자막 끄기", format: "VTT", is_ass: false, url: "" },
@@ -1735,6 +1748,10 @@ export default function Player(props: PlayerProps) {
           selector: subSelectorOptions,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onSelect: function (item: any) {
+            if (item.aiGenerate) {
+              if (generateAiSubRef.current) generateAiSubRef.current();
+              return tooltipText;
+            }
             if (item.subData.name === "자막 끄기" || (!item.subData.url && !item.subData.content)) {
               setSelectedSubIndex(-1);
               currentSubRef.current = null;
@@ -1975,6 +1992,69 @@ export default function Player(props: PlayerProps) {
       setLoadingCreatorName(null);
     }
   };
+
+  // On-demand AI Korean subtitle generator (Jimaku 일본어 원문 → Gemini 번역)
+  const handleGenerateAiSub = async () => {
+    if (aiSubLoadingRef.current) {
+      if (artRef.current) {
+        artRef.current.notice.show = "AI 한글자막을 생성하는 중입니다. 잠시만 기다려 주세요...";
+      }
+      return;
+    }
+
+    aiSubLoadingRef.current = true;
+    if (artRef.current) {
+      artRef.current.notice.show = "✨ AI 한글자막 생성 중... (최대 1분 소요)";
+    }
+
+    try {
+      const res = await fetch("/api/anime/subtitles/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: animeTitle,
+          ep: currentEpRef.current,
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.subtitle) {
+        const newSub: SubtitleItem = {
+          name: `${data.subtitle.name} (${data.subtitle.format})`,
+          format: data.subtitle.format,
+          is_ass: data.subtitle.is_ass,
+          content: data.subtitle.content,
+        };
+
+        aiSubOfferRef.current = false;
+        setSubs((prev) => {
+          const nextSubs = [newSub, ...prev.filter((s) => s.name !== newSub.name)];
+          setSelectedSubIndex(0);
+          applySubtitle(newSub, currentSyncOffset);
+          setTimeout(() => refreshSubtitleSettings(nextSubs, 0), 100);
+          return nextSubs;
+        });
+
+        if (artRef.current) {
+          artRef.current.notice.show = "✅ AI 한글자막 적용 완료!";
+        }
+      } else {
+        if (artRef.current) {
+          artRef.current.notice.show = data.message || "AI 한글자막을 생성하지 못했습니다.";
+        }
+      }
+    } catch (e) {
+      console.error("[Generate AI Sub error]:", e);
+      if (artRef.current) {
+        artRef.current.notice.show = "AI 한글자막 생성 중 오류가 발생했습니다.";
+      }
+    } finally {
+      aiSubLoadingRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    generateAiSubRef.current = handleGenerateAiSub;
+  });
 
   const autoNextRef = useRef(autoNextEnabled);
   useEffect(() => {
@@ -3282,6 +3362,7 @@ export default function Player(props: PlayerProps) {
   useEffect(() => {
     let isCancelled = false;
     setIsLoadingSubs(true);
+    aiSubOfferRef.current = false;
 
     fetch(`/api/anime/subtitles?title=${encodeURIComponent(animeTitle)}&ep=${currentEp}&animeId=${encodeURIComponent(animeId)}`)
       .then((r) => r.json())
@@ -3312,6 +3393,7 @@ export default function Player(props: PlayerProps) {
 
         const combined = [...newSubs, ...fetchedList];
         setSubs(combined);
+        aiSubOfferRef.current = data.ai_available === true && fetchedList.length === 0;
 
         const assIdx = combined.findIndex((s) => s.is_ass);
         const targetIdx = assIdx >= 0 ? assIdx : 0;
@@ -3323,6 +3405,13 @@ export default function Player(props: PlayerProps) {
           setTimeout(() => {
             if (refreshSubtitleSettingsRef.current) {
               refreshSubtitleSettingsRef.current(combined, targetIdx);
+            }
+          }, 150);
+        } else if (aiSubOfferRef.current) {
+          // 자막이 하나도 없어도 AI 생성 항목이 selector에 보이도록 갱신
+          setTimeout(() => {
+            if (refreshSubtitleSettingsRef.current) {
+              refreshSubtitleSettingsRef.current(combined, -1);
             }
           }, 150);
         }

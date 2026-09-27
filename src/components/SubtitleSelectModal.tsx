@@ -42,6 +42,7 @@ interface SubtitleSelectModalProps {
   creators: CreatorInfo[];
   currentSubName?: string;
   onSelectSubtitle: (sub: SubtitleOption) => void;
+  showAiGenerate?: boolean;
 }
 
 export default function SubtitleSelectModal({
@@ -53,6 +54,7 @@ export default function SubtitleSelectModal({
   creators,
   currentSubName,
   onSelectSubtitle,
+  showAiGenerate = false,
 }: SubtitleSelectModalProps) {
   const [mounted, setMounted] = useState(false);
   const [activeTab, setActiveTab] = useState<"creators" | "search" | "file">("creators");
@@ -67,6 +69,9 @@ export default function SubtitleSelectModal({
   // Creator download states
   const [loadingCreator, setLoadingCreator] = useState<string | null>(null);
   const [creatorError, setCreatorError] = useState<string | null>(null);
+
+  // AI subtitle generation state
+  const [isGeneratingAi, setIsGeneratingAi] = useState(false);
 
   // File upload states
   const [uploadedSub, setUploadedSub] = useState<SubtitleOption | null>(null);
@@ -127,6 +132,43 @@ export default function SubtitleSelectModal({
       setCreatorError(err.message || "자막 다운로드에 실패했습니다.");
     } finally {
       setLoadingCreator(null);
+    }
+  };
+
+  // 1-1. Generate AI Korean subtitle (Jimaku 일본어 원문 → Gemini 번역)
+  const handleGenerateAi = async () => {
+    if (isGeneratingAi) return;
+    setIsGeneratingAi(true);
+    setCreatorError(null);
+
+    try {
+      const res = await fetch("/api/anime/subtitles/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: animeTitle,
+          ep: episodeNumber,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success || !data.subtitle) {
+        throw new Error(data.message || "AI 한글자막을 생성하지 못했습니다.");
+      }
+
+      const newSub: SubtitleOption = {
+        name: data.subtitle.name,
+        format: data.subtitle.is_ass ? "ASS" : "VTT",
+        is_ass: Boolean(data.subtitle.is_ass),
+        content: data.subtitle.content,
+      };
+
+      onSelectSubtitle(newSub);
+      onClose();
+    } catch (err: any) {
+      setCreatorError(err.message || "AI 한글자막 생성 중 오류가 발생했습니다.");
+    } finally {
+      setIsGeneratingAi(false);
     }
   };
 
@@ -307,6 +349,30 @@ export default function SubtitleSelectModal({
                   <AlertCircle className="h-4 w-4 shrink-0" />
                   <span>{creatorError}</span>
                 </div>
+              )}
+
+              {showAiGenerate && (
+                <button
+                  onClick={handleGenerateAi}
+                  disabled={isGeneratingAi}
+                  className={`flex w-full items-center justify-center gap-1.5 rounded-xl px-4 py-2.5 text-xs font-bold transition shadow-md ${
+                    isGeneratingAi
+                      ? "bg-purple-600/50 text-white cursor-wait"
+                      : "bg-purple-600 text-white hover:bg-purple-500 active:scale-95"
+                  }`}
+                >
+                  {isGeneratingAi ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      AI 한글자막 생성 중... (최대 1분 소요)
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      AI 한글자막 생성
+                    </>
+                  )}
+                </button>
               )}
 
               {creators.length === 0 ? (

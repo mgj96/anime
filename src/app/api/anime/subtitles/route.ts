@@ -72,6 +72,7 @@ export async function GET(request: NextRequest) {
             website,
             is_current_ep: true,
           }] : [],
+          ai_available: Boolean(process.env.GEMINI_API_KEY && process.env.JIMAKU_API_KEY),
         }, {
           status: 200,
           headers: {
@@ -104,6 +105,7 @@ export async function GET(request: NextRequest) {
         count: validSubtitles.length,
         subtitles: validSubtitles,
         creators: result.creators,
+        ai_available: Boolean(process.env.GEMINI_API_KEY && process.env.JIMAKU_API_KEY),
       },
       {
         status: 200,
